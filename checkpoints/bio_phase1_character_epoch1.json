@@ -1,0 +1,8 @@
+{
+  "config": {
+    "gpu_device": 0,
+    "dataset_name": "cerebras/SlimPajama-627B",
+    "dataset_split": "train",
+    "streaming": true,
+    "phases": {
+      

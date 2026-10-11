@@ -561,6 +561,20 @@ inline cudaError_t launchCSRSpMV(
     float scale,
     cudaStream_t stream = 0
 ) {
+    // Safety checks: skip if matrix is empty or invalid
+    if (synapses.num_post <= 0 || synapses.nnz <= 0) {
+        return cudaSuccess;  // Nothing to compute
+    }
+    
+    // Check for null pointers
+    if (!synapses.d_row_ptr || !synapses.d_col_idx || !synapses.d_weights) {
+        return cudaSuccess;  // Invalid matrix, skip
+    }
+    
+    if (!d_spikes || !d_output) {
+        return cudaErrorInvalidValue;  // Can't proceed without input/output
+    }
+    
     int grid_size = (synapses.num_post + SPARSE_BLOCK_SIZE - 1) / SPARSE_BLOCK_SIZE;
     
     if (scale == 1.0f) {
@@ -657,6 +671,11 @@ inline cudaError_t launchUpdatePreTrace(
     int num_neurons,
     cudaStream_t stream = 0
 ) {
+    // Safety checks
+    if (num_neurons <= 0 || !d_trace || !d_spikes) {
+        return cudaSuccess;
+    }
+    
     float decay = expf(-dt / tau);
     int grid_size = (num_neurons + SPARSE_BLOCK_SIZE - 1) / SPARSE_BLOCK_SIZE;
     
@@ -678,6 +697,11 @@ inline cudaError_t launchUpdatePostTrace(
     int num_neurons,
     cudaStream_t stream = 0
 ) {
+    // Safety checks
+    if (num_neurons <= 0 || !d_trace || !d_spikes) {
+        return cudaSuccess;
+    }
+    
     float decay = expf(-dt / tau);
     int grid_size = (num_neurons + SPARSE_BLOCK_SIZE - 1) / SPARSE_BLOCK_SIZE;
     

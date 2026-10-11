@@ -1,0 +1,9 @@
+{
+  "columns": 32,
+  "width": 768,
+  "regions": 4,
+  "ticks": 2,
+  "idle_steps": 1,
+  "mel_bins": 64,
+  "speech_width": 256
+}

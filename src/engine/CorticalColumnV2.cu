@@ -55,8 +55,15 @@ CorticalColumnV2::CorticalColumnV2(const CorticalColumnConfig& config)
     , total_synapses_(0)
     , cusparse_handle_(nullptr)
     , cublas_handle_(nullptr)
+    , owns_handles_(false)
     , d_temp_currents_(nullptr)
     , d_temp_spikes_(nullptr)
+    , d_external_input_l4_(nullptr)
+    , d_external_input_l1_(nullptr)
+    , external_input_l4_size_(0)
+    , external_input_l1_size_(0)
+    , has_pending_l4_input_(false)
+    , has_pending_l1_input_(false)
     , initialized_(false)
     , simulation_time_(0.0f)
 {
@@ -98,9 +105,15 @@ CorticalColumnV2::~CorticalColumnV2() {
     if (d_temp_currents_) cudaFree(d_temp_currents_);
     if (d_temp_spikes_) cudaFree(d_temp_spikes_);
     
-    // Destroy cuSPARSE/cuBLAS handles
-    if (cusparse_handle_) cusparseDestroy(cusparse_handle_);
-    if (cublas_handle_) cublasDestroy(cublas_handle_);
+    // Free external input buffers
+    if (d_external_input_l4_) cudaFree(d_external_input_l4_);
+    if (d_external_input_l1_) cudaFree(d_external_input_l1_);
+    
+    // Destroy cuSPARSE/cuBLAS handles only if we own them
+    if (owns_handles_) {
+        if (cusparse_handle_) cusparseDestroy(cusparse_handle_);
+        if (cublas_handle_) cublasDestroy(cublas_handle_);
+    }
 }
 
 CorticalColumnV2::CorticalColumnV2(CorticalColumnV2&& other) noexcept
@@ -117,16 +130,28 @@ CorticalColumnV2::CorticalColumnV2(CorticalColumnV2&& other) noexcept
     , layer_params_(other.layer_params_)
     , cusparse_handle_(other.cusparse_handle_)
     , cublas_handle_(other.cublas_handle_)
+    , owns_handles_(other.owns_handles_)
     , d_temp_currents_(other.d_temp_currents_)
     , d_temp_spikes_(other.d_temp_spikes_)
+    , d_external_input_l4_(other.d_external_input_l4_)
+    , d_external_input_l1_(other.d_external_input_l1_)
+    , external_input_l4_size_(other.external_input_l4_size_)
+    , external_input_l1_size_(other.external_input_l1_size_)
+    , has_pending_l4_input_(other.has_pending_l4_input_)
+    , has_pending_l1_input_(other.has_pending_l1_input_)
     , initialized_(other.initialized_)
     , simulation_time_(other.simulation_time_)
 {
     // Null out moved-from object
     other.cusparse_handle_ = nullptr;
     other.cublas_handle_ = nullptr;
+    other.owns_handles_ = false;
     other.d_temp_currents_ = nullptr;
     other.d_temp_spikes_ = nullptr;
+    other.d_external_input_l4_ = nullptr;
+    other.d_external_input_l1_ = nullptr;
+    other.has_pending_l4_input_ = false;
+    other.has_pending_l1_input_ = false;
     other.initialized_ = false;
 }
 
@@ -140,8 +165,12 @@ CorticalColumnV2& CorticalColumnV2::operator=(CorticalColumnV2&& other) noexcept
         all_synapses_bsr_.free();
         if (d_temp_currents_) cudaFree(d_temp_currents_);
         if (d_temp_spikes_) cudaFree(d_temp_spikes_);
-        if (cusparse_handle_) cusparseDestroy(cusparse_handle_);
-        if (cublas_handle_) cublasDestroy(cublas_handle_);
+        if (d_external_input_l4_) cudaFree(d_external_input_l4_);
+        if (d_external_input_l1_) cudaFree(d_external_input_l1_);
+        if (owns_handles_) {
+            if (cusparse_handle_) cusparseDestroy(cusparse_handle_);
+            if (cublas_handle_) cublasDestroy(cublas_handle_);
+        }
         
         // Move from other
         config_ = std::move(other.config_);
@@ -157,15 +186,27 @@ CorticalColumnV2& CorticalColumnV2::operator=(CorticalColumnV2&& other) noexcept
         layer_params_ = other.layer_params_;
         cusparse_handle_ = other.cusparse_handle_;
         cublas_handle_ = other.cublas_handle_;
+        owns_handles_ = other.owns_handles_;
         d_temp_currents_ = other.d_temp_currents_;
         d_temp_spikes_ = other.d_temp_spikes_;
+        d_external_input_l4_ = other.d_external_input_l4_;
+        d_external_input_l1_ = other.d_external_input_l1_;
+        external_input_l4_size_ = other.external_input_l4_size_;
+        external_input_l1_size_ = other.external_input_l1_size_;
+        has_pending_l4_input_ = other.has_pending_l4_input_;
+        has_pending_l1_input_ = other.has_pending_l1_input_;
         initialized_ = other.initialized_;
         simulation_time_ = other.simulation_time_;
         
         other.cusparse_handle_ = nullptr;
         other.cublas_handle_ = nullptr;
+        other.owns_handles_ = false;
         other.d_temp_currents_ = nullptr;
         other.d_temp_spikes_ = nullptr;
+        other.d_external_input_l4_ = nullptr;
+        other.d_external_input_l1_ = nullptr;
+        other.has_pending_l4_input_ = false;
+        other.has_pending_l1_input_ = false;
         other.initialized_ = false;
     }
     return *this;
@@ -186,16 +227,31 @@ cudaError_t CorticalColumnV2::initialize() {
     err = cudaSetDevice(config_.gpu_device);
     if (err != cudaSuccess) return err;
     
-    // Create cuSPARSE handle
-    cusparseStatus_t spErr = cusparseCreate(&cusparse_handle_);
-    if (spErr != CUSPARSE_STATUS_SUCCESS) {
-        return cudaErrorUnknown;
+    // Use shared handles if provided, otherwise create our own
+    if (config_.shared_cusparse_handle != nullptr) {
+        cusparse_handle_ = config_.shared_cusparse_handle;
+        owns_handles_ = false;
+    } else {
+        cusparseStatus_t spErr = cusparseCreate(&cusparse_handle_);
+        if (spErr != CUSPARSE_STATUS_SUCCESS) {
+            return cudaErrorUnknown;
+        }
+        owns_handles_ = true;
     }
     
-    // Create cuBLAS handle
-    cublasStatus_t blErr = cublasCreate(&cublas_handle_);
-    if (blErr != CUBLAS_STATUS_SUCCESS) {
-        return cudaErrorUnknown;
+    if (config_.shared_cublas_handle != nullptr) {
+        cublas_handle_ = config_.shared_cublas_handle;
+        // owns_handles_ already set above based on cusparse
+    } else if (owns_handles_) {
+        // Only create cublas if we also created cusparse
+        cublasStatus_t blErr = cublasCreate(&cublas_handle_);
+        if (blErr != CUBLAS_STATUS_SUCCESS) {
+            if (owns_handles_ && cusparse_handle_) {
+                cusparseDestroy(cusparse_handle_);
+                cusparse_handle_ = nullptr;
+            }
+            return cudaErrorUnknown;
+        }
     }
     
     // Allocate neurons
@@ -212,6 +268,22 @@ cudaError_t CorticalColumnV2::initialize() {
     
     err = cudaMalloc(&d_temp_spikes_, total_neurons_ * sizeof(float));
     if (err != cudaSuccess) return err;
+    
+    // Allocate external input buffers
+    int l4_neurons = neurons_per_layer_[static_cast<int>(CorticalLayer::L4)];
+    int l1_neurons = neurons_per_layer_[static_cast<int>(CorticalLayer::L1)];
+    
+    err = cudaMalloc(&d_external_input_l4_, l4_neurons * sizeof(float));
+    if (err != cudaSuccess) return err;
+    
+    err = cudaMalloc(&d_external_input_l1_, l1_neurons * sizeof(float));
+    if (err != cudaSuccess) return err;
+    
+    // Initialize input buffers to zero
+    cudaMemset(d_external_input_l4_, 0, l4_neurons * sizeof(float));
+    cudaMemset(d_external_input_l1_, 0, l1_neurons * sizeof(float));
+    has_pending_l4_input_ = false;
+    has_pending_l1_input_ = false;
     
     initialized_ = true;
     return cudaSuccess;
@@ -260,16 +332,39 @@ cudaError_t CorticalColumnV2::generateConnectivity() {
     // Intra-layer connections
     for (int layer = 0; layer < 6; ++layer) {
         int n = neurons_per_layer_[layer];
+        
+        // Skip layers with too few neurons for meaningful connectivity
+        if (n < 2) {
+            // Initialize empty matrix to prevent null pointer issues
+            intra_layer_synapses_[layer].num_pre = n;
+            intra_layer_synapses_[layer].num_post = n;
+            intra_layer_synapses_[layer].nnz = 0;
+            continue;
+        }
+        
         float density = layer_params_[layer].connectivity_density;
         int estimated_synapses = static_cast<int>(n * n * density);
         
+        // Ensure at least some synapses for small layers
+        estimated_synapses = std::max(estimated_synapses, std::min(n * 2, 10));
+        
         err = intra_layer_synapses_[layer].allocate(n, n, estimated_synapses);
-        if (err != cudaSuccess) return err;
+        if (err != cudaSuccess) {
+            // Clear error and skip this layer
+            cudaGetLastError();
+            intra_layer_synapses_[layer].num_pre = n;
+            intra_layer_synapses_[layer].num_post = n;
+            intra_layer_synapses_[layer].nnz = 0;
+            continue;
+        }
         
         // Generate random connectivity on device
         // (In production, this would use the connectivity generation kernels)
         err = generateConnectivityForLayer(layer);
-        if (err != cudaSuccess) return err;
+        if (err != cudaSuccess) {
+            // Clear error and continue - layer will have no internal connections
+            cudaGetLastError();
+        }
     }
     
     // Inter-layer connections based on canonical connectivity
@@ -277,15 +372,25 @@ cudaError_t CorticalColumnV2::generateConnectivity() {
         for (int dst = 0; dst < 6; ++dst) {
             float conn_prob = InterLayerConnectivity::connectivity[src][dst];
             if (conn_prob > 0.001f) {  // Only create if meaningful connectivity
-                CSRSynapseMatrix matrix;
-                
                 int n_src = neurons_per_layer_[src];
                 int n_dst = neurons_per_layer_[dst];
+                
+                // Skip if either layer has too few neurons
+                if (n_src < 1 || n_dst < 1) continue;
+                
                 int estimated = static_cast<int>(n_src * n_dst * conn_prob);
                 
+                // Ensure at least some connections for small layers
+                estimated = std::max(estimated, std::min(n_src, n_dst));
+                
                 if (estimated > 0) {
+                    CSRSynapseMatrix matrix;
                     err = matrix.allocate(n_src, n_dst, estimated);
-                    if (err != cudaSuccess) return err;
+                    if (err != cudaSuccess) {
+                        // Clear error and skip this connection
+                        cudaGetLastError();
+                        continue;
+                    }
                     
                     inter_layer_synapses_.push_back(std::move(matrix));
                 }
@@ -302,6 +407,18 @@ cudaError_t CorticalColumnV2::generateConnectivity() {
         total_synapses_ += syn.nnz;
     }
     
+    // Log connectivity statistics
+    std::cout << "🔗 Connectivity generated for column with " << total_neurons_ << " neurons:" << std::endl;
+    for (int i = 0; i < 6; ++i) {
+        int n = neurons_per_layer_[i];
+        int nnz = intra_layer_synapses_[i].nnz;
+        float density = (n > 1) ? (float)nnz / (n * (n - 1)) : 0.0f;
+        std::cout << "   L" << (i+1) << ": " << n << " neurons, " << nnz 
+                  << " intra-layer synapses (density=" << (density * 100.0f) << "%)" << std::endl;
+    }
+    std::cout << "   Inter-layer connections: " << inter_layer_synapses_.size() << " pathways" << std::endl;
+    std::cout << "   Total synapses: " << total_synapses_ << std::endl;
+    
     return cudaSuccess;
 }
 
@@ -311,10 +428,17 @@ cudaError_t CorticalColumnV2::generateConnectivityForLayer(int layer) {
 
     CSRSynapseMatrix& syn = intra_layer_synapses_[layer];
     int n = neurons_per_layer_[layer];
+    
+    // Safety check: skip if layer is too small
+    if (n < 2) {
+        syn.nnz = 0;
+        return cudaSuccess;
+    }
 
     // Calculate layer dimensions for topographic mapping
     // Approximate square grid for simplicity
     int width = static_cast<int>(std::sqrt(static_cast<float>(n)));
+    if (width < 1) width = 1;
     int height = (n + width - 1) / width;
 
     std::cout << "🧬 Generating biological connectivity for layer " << layer
@@ -337,7 +461,9 @@ cudaError_t CorticalColumnV2::generateConnectivityForLayer(int layer) {
         col_idx.clear();
         weights.clear();
 
-        row_ptr.push_back(0);
+        // Pre-allocate row_ptr with correct size (n+1 elements for CSR format)
+        row_ptr.resize(n + 1, 0);
+        
         for (int i = 0; i < n; ++i) {
             for (int j = 0; j < n; ++j) {
                 if (i != j && (float)rand() / RAND_MAX < density) {
@@ -346,15 +472,31 @@ cudaError_t CorticalColumnV2::generateConnectivityForLayer(int layer) {
                     weights.push_back(std::max(0.0f, std::min(1.0f, w)));
                 }
             }
-            row_ptr[i + 1] = col_idx.size();
+            row_ptr[i + 1] = static_cast<int>(col_idx.size());
         }
+    }
+    
+    // Handle case where no synapses were generated
+    if (col_idx.empty()) {
+        syn.nnz = 0;
+        // Still need to set row_ptr to all zeros
+        if (row_ptr.size() == static_cast<size_t>(n + 1) && syn.d_row_ptr) {
+            cudaMemset(syn.d_row_ptr, 0, (n + 1) * sizeof(int));
+        }
+        return cudaSuccess;
     }
 
     // Reallocate to actual size
     syn.nnz = col_idx.size();
 
-    // Upload to GPU
+    // Upload to GPU (with safety checks for null pointers)
     cudaError_t err;
+    
+    if (!syn.d_row_ptr || !syn.d_col_idx || !syn.d_weights) {
+        std::cerr << "⚠️  Synapse buffers not allocated for layer " << layer << std::endl;
+        return cudaErrorMemoryAllocation;
+    }
+    
     err = cudaMemcpy(syn.d_row_ptr, row_ptr.data(), (n + 1) * sizeof(int), cudaMemcpyHostToDevice);
     if (err != cudaSuccess) return err;
 
@@ -364,16 +506,23 @@ cudaError_t CorticalColumnV2::generateConnectivityForLayer(int layer) {
     err = cudaMemcpy(syn.d_weights, weights.data(), syn.nnz * sizeof(float), cudaMemcpyHostToDevice);
     if (err != cudaSuccess) return err;
 
-    // Initialize eligibility traces to zero
-    err = cudaMemset(syn.d_eligibility, 0, syn.nnz * sizeof(float));
-    if (err != cudaSuccess) return err;
+    // Initialize eligibility traces to zero (with null checks)
+    if (syn.d_eligibility) {
+        err = cudaMemset(syn.d_eligibility, 0, syn.nnz * sizeof(float));
+        if (err != cudaSuccess) return err;
+    }
 
-    err = cudaMemset(syn.d_pre_trace, 0, syn.num_pre * sizeof(float));
-    if (err != cudaSuccess) return err;
+    if (syn.d_pre_trace) {
+        err = cudaMemset(syn.d_pre_trace, 0, syn.num_pre * sizeof(float));
+        if (err != cudaSuccess) return err;
+    }
 
-    err = cudaMemset(syn.d_post_trace, 0, syn.num_post * sizeof(float));
+    if (syn.d_post_trace) {
+        err = cudaMemset(syn.d_post_trace, 0, syn.num_post * sizeof(float));
+        if (err != cudaSuccess) return err;
+    }
 
-    return err;
+    return cudaSuccess;
 }
 
 // ============================================================================
@@ -395,6 +544,29 @@ cudaError_t CorticalColumnV2::step(float dt, float current_time) {
             config_.stream
         );
         if (err != cudaSuccess) return err;
+    }
+    
+    // 1.5. Apply pending external inputs (AFTER reset, so they're not wiped!)
+    if (has_pending_l4_input_ && d_external_input_l4_ && external_input_l4_size_ > 0) {
+        float* dst = layer_neurons_[static_cast<int>(CorticalLayer::L4)].d_current;
+        if (dst) {
+            err = cudaMemcpy(dst, d_external_input_l4_, 
+                           external_input_l4_size_ * sizeof(float), 
+                           cudaMemcpyDeviceToDevice);
+            if (err != cudaSuccess) return err;
+        }
+        has_pending_l4_input_ = false;  // Input consumed
+    }
+    
+    if (has_pending_l1_input_ && d_external_input_l1_ && external_input_l1_size_ > 0) {
+        float* dst = layer_neurons_[static_cast<int>(CorticalLayer::L1)].d_current;
+        if (dst) {
+            err = cudaMemcpy(dst, d_external_input_l1_, 
+                           external_input_l1_size_ * sizeof(float), 
+                           cudaMemcpyDeviceToDevice);
+            if (err != cudaSuccess) return err;
+        }
+        has_pending_l1_input_ = false;  // Feedback consumed
     }
     
     // 2. Propagate synapses (intra-layer)
@@ -435,6 +607,11 @@ cudaError_t CorticalColumnV2::propagateSynapses() {
     
     // Intra-layer propagation
     for (int layer = 0; layer < 6; ++layer) {
+        // Skip if layer has no neurons or synapse matrix is invalid
+        if (neurons_per_layer_[layer] <= 0) continue;
+        if (!layer_neurons_[layer].d_spike_output || !layer_neurons_[layer].d_current) continue;
+        if (intra_layer_synapses_[layer].nnz <= 0) continue;
+        
         err = kernels::launchCSRSpMV(
             intra_layer_synapses_[layer],
             layer_neurons_[layer].d_spike_output,
@@ -442,16 +619,33 @@ cudaError_t CorticalColumnV2::propagateSynapses() {
             1.0f,
             config_.stream
         );
-        if (err != cudaSuccess) return err;
+        if (err != cudaSuccess) {
+            // Clear error and continue - don't let one layer break the whole column
+            cudaGetLastError();
+        }
     }
     
     // Inter-layer propagation
     // Map inter-layer synapses to source/destination layers
-    int syn_idx = 0;
+    size_t syn_idx = 0;
     for (int src = 0; src < 6; ++src) {
         for (int dst = 0; dst < 6; ++dst) {
             float conn_prob = InterLayerConnectivity::connectivity[src][dst];
             if (conn_prob > 0.001f && syn_idx < inter_layer_synapses_.size()) {
+                // Safety checks
+                if (neurons_per_layer_[src] <= 0 || neurons_per_layer_[dst] <= 0) {
+                    syn_idx++;
+                    continue;
+                }
+                if (!layer_neurons_[src].d_spike_output || !layer_neurons_[dst].d_current) {
+                    syn_idx++;
+                    continue;
+                }
+                if (inter_layer_synapses_[syn_idx].nnz <= 0) {
+                    syn_idx++;
+                    continue;
+                }
+                
                 err = kernels::launchCSRSpMV(
                     inter_layer_synapses_[syn_idx],
                     layer_neurons_[src].d_spike_output,
@@ -459,7 +653,10 @@ cudaError_t CorticalColumnV2::propagateSynapses() {
                     1.0f,
                     config_.stream
                 );
-                if (err != cudaSuccess) return err;
+                if (err != cudaSuccess) {
+                    // Clear error and continue
+                    cudaGetLastError();
+                }
                 syn_idx++;
             }
         }
@@ -474,27 +671,39 @@ cudaError_t CorticalColumnV2::updateTraces(float dt) {
     float tau_trace = config_.synapse_params.stdp_tau_pre;
     
     for (int layer = 0; layer < 6; ++layer) {
-        // Update presynaptic traces
-        err = kernels::launchUpdatePreTrace(
-            intra_layer_synapses_[layer].d_pre_trace,
-            layer_neurons_[layer].d_spike_output,
-            tau_trace,
-            dt,
-            neurons_per_layer_[layer],
-            config_.stream
-        );
-        if (err != cudaSuccess) return err;
+        // Skip if layer has no neurons or invalid pointers
+        if (neurons_per_layer_[layer] <= 0) continue;
+        if (!layer_neurons_[layer].d_spike_output) continue;
         
-        // Update postsynaptic traces
-        err = kernels::launchUpdatePostTrace(
-            intra_layer_synapses_[layer].d_post_trace,
-            layer_neurons_[layer].d_spike_output,
-            tau_trace,
-            dt,
-            neurons_per_layer_[layer],
-            config_.stream
-        );
-        if (err != cudaSuccess) return err;
+        // Update presynaptic traces (only if trace buffer exists)
+        if (intra_layer_synapses_[layer].d_pre_trace) {
+            err = kernels::launchUpdatePreTrace(
+                intra_layer_synapses_[layer].d_pre_trace,
+                layer_neurons_[layer].d_spike_output,
+                tau_trace,
+                dt,
+                neurons_per_layer_[layer],
+                config_.stream
+            );
+            if (err != cudaSuccess) {
+                cudaGetLastError();  // Clear and continue
+            }
+        }
+        
+        // Update postsynaptic traces (only if trace buffer exists)
+        if (intra_layer_synapses_[layer].d_post_trace) {
+            err = kernels::launchUpdatePostTrace(
+                intra_layer_synapses_[layer].d_post_trace,
+                layer_neurons_[layer].d_spike_output,
+                tau_trace,
+                dt,
+                neurons_per_layer_[layer],
+                config_.stream
+            );
+            if (err != cudaSuccess) {
+                cudaGetLastError();  // Clear and continue
+            }
+        }
     }
     
     return cudaSuccess;
@@ -505,45 +714,107 @@ cudaError_t CorticalColumnV2::updateTraces(float dt) {
 // ============================================================================
 
 cudaError_t CorticalColumnV2::injectFeedforwardInput(const float* d_input, int input_size) {
-    // Inject into L4 (feedforward input layer)
+    // Safety check: return if not initialized
+    if (!initialized_ || !d_input || input_size <= 0) {
+        return cudaSuccess;
+    }
+    
+    // Store input in external buffer (will be applied after current reset in step())
     int l4_neurons = neurons_per_layer_[static_cast<int>(CorticalLayer::L4)];
     int copy_size = std::min(input_size, l4_neurons);
     
-    // Add to existing currents
-    // Simple version: copy directly (in production, use kernel to add)
-    return cudaMemcpy(
-        layer_neurons_[static_cast<int>(CorticalLayer::L4)].d_current,
+    // Safety check: ensure external buffer is allocated
+    if (!d_external_input_l4_) {
+        return cudaSuccess;
+    }
+    
+    // Copy to external input buffer
+    cudaError_t err = cudaMemcpy(
+        d_external_input_l4_,
         d_input,
         copy_size * sizeof(float),
         cudaMemcpyDeviceToDevice
     );
+    
+    if (err == cudaSuccess) {
+        external_input_l4_size_ = copy_size;
+        has_pending_l4_input_ = true;
+    }
+    
+    return err;
 }
 
 cudaError_t CorticalColumnV2::injectFeedbackInput(const float* d_feedback, int feedback_size) {
-    // Inject into L1 (feedback/context layer)
+    // Safety check: return if not initialized
+    if (!initialized_ || !d_feedback || feedback_size <= 0) {
+        return cudaSuccess;
+    }
+    
+    // Store feedback in external buffer (will be applied after current reset in step())
     int l1_neurons = neurons_per_layer_[static_cast<int>(CorticalLayer::L1)];
     int copy_size = std::min(feedback_size, l1_neurons);
     
-    return cudaMemcpy(
-        layer_neurons_[static_cast<int>(CorticalLayer::L1)].d_current,
+    // Safety check: ensure external buffer is allocated
+    if (!d_external_input_l1_) {
+        return cudaSuccess;
+    }
+    
+    // Copy to external feedback buffer
+    cudaError_t err = cudaMemcpy(
+        d_external_input_l1_,
         d_feedback,
         copy_size * sizeof(float),
         cudaMemcpyDeviceToDevice
     );
+    
+    if (err == cudaSuccess) {
+        external_input_l1_size_ = copy_size;
+        has_pending_l1_input_ = true;
+    }
+    
+    return err;
 }
 
 cudaError_t CorticalColumnV2::getOutput(float* d_output, int output_size) const {
+    // Safety check: return zeros if not initialized
+    if (!initialized_ || !d_output || output_size <= 0) {
+        if (d_output && output_size > 0) {
+            // Zero out the output buffer to prevent garbage values
+            return cudaMemset(d_output, 0, output_size * sizeof(float));
+        }
+        return cudaSuccess;
+    }
+    
     // Get output from L5 (output layer)
     int l5_neurons = neurons_per_layer_[static_cast<int>(CorticalLayer::L5)];
     int copy_size = std::min(output_size, l5_neurons);
     
-    // Copy firing rates as output
-    return cudaMemcpy(
+    // Use d_spike_output (weighted spike output per timestep) instead of d_firing_rate
+    // d_firing_rate is an exponential moving average that's slow to respond
+    // d_spike_output contains actual neural activity for this timestep
+    const float* src = layer_neurons_[static_cast<int>(CorticalLayer::L5)].d_spike_output;
+    if (!src) {
+        // Fallback to firing rate if spike_output not available
+        src = layer_neurons_[static_cast<int>(CorticalLayer::L5)].d_firing_rate;
+        if (!src) {
+            return cudaMemset(d_output, 0, output_size * sizeof(float));
+        }
+    }
+    
+    // Copy spike outputs as output
+    cudaError_t err = cudaMemcpy(
         d_output,
-        layer_neurons_[static_cast<int>(CorticalLayer::L5)].d_firing_rate,
+        src,
         copy_size * sizeof(float),
         cudaMemcpyDeviceToDevice
     );
+    
+    // Zero remaining output if L5 is smaller than requested
+    if (copy_size < output_size) {
+        cudaMemset(d_output + copy_size, 0, (output_size - copy_size) * sizeof(float));
+    }
+    
+    return err;
 }
 
 // ============================================================================
@@ -551,7 +822,7 @@ cudaError_t CorticalColumnV2::getOutput(float* d_output, int output_size) const 
 // ============================================================================
 
 cudaError_t CorticalColumnV2::applySTDP(float dopamine_signal) {
-    if (!config_.enable_stdp) {
+    if (!config_.enable_stdp || !initialized_) {
         return cudaSuccess;
     }
     
@@ -591,7 +862,7 @@ cudaError_t CorticalColumnV2::applySTDP(float dopamine_signal) {
 }
 
 cudaError_t CorticalColumnV2::applyHomeostasis() {
-    if (!config_.enable_homeostasis) {
+    if (!config_.enable_homeostasis || !initialized_) {
         return cudaSuccess;
     }
     
@@ -615,6 +886,10 @@ cudaError_t CorticalColumnV2::applyHomeostasis() {
 }
 
 cudaError_t CorticalColumnV2::modulateLearning(float dopamine, float acetylcholine, float serotonin) {
+    if (!initialized_) {
+        return cudaSuccess;
+    }
+    
     cudaError_t err;
     
     for (int layer = 0; layer < 6; ++layer) {

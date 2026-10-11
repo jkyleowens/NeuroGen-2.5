@@ -74,10 +74,10 @@ inline std::array<LayerParams, 6> getDefaultLayerParams(int neurons_per_column) 
     
     // L1: Sparse, mostly inhibitory (Martinotti cell targets)
     params[0] = {
-        .num_excitatory = static_cast<int>(neurons_per_column * 0.02f),
-        .num_inhibitory = static_cast<int>(neurons_per_column * 0.01f),
+        .num_excitatory = std::max(1, static_cast<int>(neurons_per_column * 0.02f)),
+        .num_inhibitory = std::max(1, static_cast<int>(neurons_per_column * 0.01f)),
         .exc_inh_ratio = 2.0f,
-        .connectivity_density = 0.05f,
+        .connectivity_density = 0.15f,  // Was 0.05f - need more connections
         .learning_rate = 0.001f,
         .exc_type = NeuronType::PYRAMIDAL,
         .inh_type = NeuronType::SOM_MARTINOTTI
@@ -85,36 +85,37 @@ inline std::array<LayerParams, 6> getDefaultLayerParams(int neurons_per_column) 
     
     // L2/3: Dense, high connectivity (cortico-cortical)
     params[1] = {
-        .num_excitatory = static_cast<int>(neurons_per_column * 0.20f),
-        .num_inhibitory = static_cast<int>(neurons_per_column * 0.05f),
+        .num_excitatory = std::max(1, static_cast<int>(neurons_per_column * 0.20f)),
+        .num_inhibitory = std::max(1, static_cast<int>(neurons_per_column * 0.05f)),
         .exc_inh_ratio = 4.0f,
-        .connectivity_density = 0.15f,
+        .connectivity_density = 0.30f,  // Was 0.15f - dense connectivity
         .learning_rate = 0.01f,
         .exc_type = NeuronType::PYRAMIDAL,
         .inh_type = NeuronType::PV_BASKET
     };
     
     params[2] = params[1]; // L3 similar to L2
-    params[2].num_excitatory = static_cast<int>(neurons_per_column * 0.25f);
-    params[2].num_inhibitory = static_cast<int>(neurons_per_column * 0.06f);
+    params[2].num_excitatory = std::max(1, static_cast<int>(neurons_per_column * 0.25f));
+    params[2].num_inhibitory = std::max(1, static_cast<int>(neurons_per_column * 0.06f));
+    params[2].connectivity_density = 0.30f;  // Explicit dense connectivity
     
-    // L4: Input layer (spiny stellate cells)
+    // L4: Input layer (spiny stellate cells) - CRITICAL for feedforward
     params[3] = {
-        .num_excitatory = static_cast<int>(neurons_per_column * 0.15f),
-        .num_inhibitory = static_cast<int>(neurons_per_column * 0.04f),
+        .num_excitatory = std::max(1, static_cast<int>(neurons_per_column * 0.15f)),
+        .num_inhibitory = std::max(1, static_cast<int>(neurons_per_column * 0.04f)),
         .exc_inh_ratio = 4.0f,
-        .connectivity_density = 0.20f,
+        .connectivity_density = 0.35f,  // Was 0.20f - very dense for input processing
         .learning_rate = 0.005f,
         .exc_type = NeuronType::SPINY_STELLATE,
         .inh_type = NeuronType::PV_BASKET
     };
     
-    // L5: Output layer (thick-tufted pyramidal)
+    // L5: Output layer (thick-tufted pyramidal) - CRITICAL for output
     params[4] = {
-        .num_excitatory = static_cast<int>(neurons_per_column * 0.15f),
-        .num_inhibitory = static_cast<int>(neurons_per_column * 0.04f),
+        .num_excitatory = std::max(1, static_cast<int>(neurons_per_column * 0.15f)),
+        .num_inhibitory = std::max(1, static_cast<int>(neurons_per_column * 0.04f)),
         .exc_inh_ratio = 4.0f,
-        .connectivity_density = 0.12f,
+        .connectivity_density = 0.25f,  // Was 0.12f - need strong recurrence
         .learning_rate = 0.01f,
         .exc_type = NeuronType::PYRAMIDAL,
         .inh_type = NeuronType::PV_BASKET
@@ -122,10 +123,10 @@ inline std::array<LayerParams, 6> getDefaultLayerParams(int neurons_per_column) 
     
     // L6: Feedback layer
     params[5] = {
-        .num_excitatory = static_cast<int>(neurons_per_column * 0.10f),
-        .num_inhibitory = static_cast<int>(neurons_per_column * 0.03f),
+        .num_excitatory = std::max(1, static_cast<int>(neurons_per_column * 0.10f)),
+        .num_inhibitory = std::max(1, static_cast<int>(neurons_per_column * 0.03f)),
         .exc_inh_ratio = 3.5f,
-        .connectivity_density = 0.10f,
+        .connectivity_density = 0.20f,  // Was 0.10f
         .learning_rate = 0.008f,
         .exc_type = NeuronType::PYRAMIDAL,
         .inh_type = NeuronType::SOM_MARTINOTTI
@@ -191,6 +192,11 @@ struct CorticalColumnConfig {
     // GPU
     int gpu_device = 0;
     cudaStream_t stream = 0;
+    
+    // Shared handles (optional - if null, column creates its own)
+    // Use shared handles when creating many columns to avoid handle exhaustion
+    cusparseHandle_t shared_cusparse_handle = nullptr;
+    cublasHandle_t shared_cublas_handle = nullptr;
 };
 
 /**
@@ -354,10 +360,19 @@ private:
     // GPU resources
     cusparseHandle_t cusparse_handle_;
     cublasHandle_t cublas_handle_;
+    bool owns_handles_;  // True if column created its own handles (and must destroy them)
     
     // Temporary buffers
     float* d_temp_currents_;     // For accumulating synaptic currents
     float* d_temp_spikes_;       // For spike propagation
+    
+    // External input buffers (applied after current reset in step())
+    float* d_external_input_l4_; // Feedforward input buffer
+    float* d_external_input_l1_; // Feedback input buffer
+    int external_input_l4_size_; // Size of pending L4 input
+    int external_input_l1_size_; // Size of pending L1 input
+    bool has_pending_l4_input_;  // Flag: external input waiting
+    bool has_pending_l1_input_;  // Flag: feedback input waiting
     
     // State tracking
     bool initialized_;

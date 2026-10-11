@@ -1,5 +1,0 @@
-{
-  "model_path": "./nlp_agent_tokenizer.model",
-  "config": {},
-  "vocab_size": 32000
-}

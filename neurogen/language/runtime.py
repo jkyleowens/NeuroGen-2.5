@@ -114,9 +114,10 @@ class Session:
 
 def load_runtime(args):
     torch.set_num_threads(args.threads)
-    device = device_for(args.device)
+    from .native import NATIVE_DEVICES, inference_model
+    device = device_for('cpu' if args.device in NATIVE_DEVICES else args.device)
     model, payload = load_checkpoint(args.checkpoint, device)
-    return model, payload
+    return inference_model(model, args.device), payload
 
 
 def listen(args):
@@ -260,7 +261,7 @@ def stream(args):
             cancellation.set()
         cancellations.clear()
 
-    emit('ready', speech_trained=payload.get('speech_trained', False), device=str(session.device))
+    emit('ready', speech_trained=payload.get('speech_trained', False), device=getattr(model, 'native_backend', str(session.device)))
     try:
         while not eof or remaining:
             try:

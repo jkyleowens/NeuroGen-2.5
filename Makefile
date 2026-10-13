@@ -21,3 +21,15 @@ language-doctor:
 
 gui:
 	$(PYTHON) -m neurogen gui
+
+# Optional portable C++ inference engine. See NATIVE.md for GPU build options.
+CMAKE ?= cmake
+NATIVE_OPTIONS ?=
+.PHONY: native native-test
+native:
+	$(CMAKE) -S . -B build/native -DCMAKE_BUILD_TYPE=Release $(NATIVE_OPTIONS)
+	$(CMAKE) --build build/native --parallel 2
+
+native-test: native
+	ctest --test-dir build/native --output-on-failure
+	$(PYTHON) -m unittest discover -s tests -p test_native.py -v

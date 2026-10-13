@@ -14,7 +14,7 @@ def device_for(name):
     if name == 'auto':
         return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if name not in ('cuda', 'rocm'):
-        raise ValueError('Device must be auto, cpu, cuda, or rocm')
+        raise ValueError('Training requires auto, cpu, cuda, or rocm. Native CPU/CUDA/Vulkan devices are inference-only; see NATIVE.md.')
     if not torch.version.cuda and not torch.version.hip:
         raise ValueError(
             f'{name} requested, but PyTorch {torch.__version__} is a CPU-only build in {sys.executable}. '
@@ -56,6 +56,10 @@ def environment(device):
 
 
 def doctor(args):
+    from .native import NATIVE_DEVICES
+    if args.device in NATIVE_DEVICES:
+        from .native_doctor import doctor as native_doctor
+        return native_doctor(args)
     torch.set_num_threads(args.threads)
     try:
         device = device_for(args.device)

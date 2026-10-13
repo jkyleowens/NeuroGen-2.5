@@ -5,12 +5,12 @@ def add_language_parser(commands):
     language = commands.add_parser('language', help='Train and run the hybrid spiking language/speech model')
     actions = language.add_subparsers(dest='action', required=True)
 
-    def common(parser):
-        parser.add_argument('--device', choices=('auto', 'cpu', 'cuda', 'rocm'), default='auto')
+    def common(parser, native=False):
+        parser.add_argument('--device', choices=('auto', 'cpu', 'cuda', 'rocm') + (('native-cpu', 'native-cuda', 'vulkan') if native else ()), default='auto')
         parser.add_argument('--threads', type=int, default=1)
 
     doctor = actions.add_parser('doctor', help='Inspect hardware and execute a forward/backward device check')
-    common(doctor)
+    common(doctor, native=True)
     doctor.add_argument('--preset', choices=('tiny', 'laptop', 'bc250', 'large'), default='bc250')
 
     train = actions.add_parser('train', help='Supervised text/dialogue and optional paired-speech training')
@@ -50,7 +50,7 @@ def add_language_parser(commands):
 
     for action in ('stream', 'chat', 'listen', 'speak'):
         parser = actions.add_parser(action)
-        common(parser)
+        common(parser, native=True)
         parser.add_argument('--checkpoint', required=True)
         if action in ('stream', 'chat'):
             parser.add_argument('--max-new-tokens', type=int, default=256, help='Maximum generated UTF-8 bytes per turn')

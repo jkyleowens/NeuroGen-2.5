@@ -142,7 +142,7 @@ class Workbench:
         self.checkpoint_picker.pack(side='left', fill='x', expand=True, padx=(0, 8))
         self.button(toolbar, 'Browse checkpoint', lambda: self.browse(self.checkpoint, types=[('Language checkpoints', '*.pt *.pth'), ('All files', '*')])).pack(side='left', padx=4)
         self.device = self.variable('device', 'auto')
-        device_picker = ttk.Combobox(toolbar, textvariable=self.device, values=('auto', 'cpu', 'cuda', 'rocm'), state='readonly', width=7)
+        device_picker = ttk.Combobox(toolbar, textvariable=self.device, values=('auto', 'cpu', 'cuda', 'rocm', 'native-cpu', 'native-cuda', 'vulkan'), state='readonly', width=12)
         device_picker.pack(side='left', padx=8)
         device_picker.bind('<<ComboboxSelected>>', lambda event: self.status.set(
             f'Selected {self.device.get()}; reload the model to apply. New jobs use this device.'))
@@ -591,6 +591,8 @@ class Workbench:
         return str(path)
 
     def start_training(self):
+        if self.device.get() in ('native-cpu', 'native-cuda', 'vulkan'):
+            raise ValueError('Select cpu, cuda, rocm, or auto for training. Native devices support inference; reload trained weights afterward.')
         args = ['language', 'train', '--device', self.device.get()]
         if self.data_source.get() == 'SlimPajama (automatic)':
             args += ['--data-source', 'slimpajama']

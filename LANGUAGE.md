@@ -1,5 +1,9 @@
 # Trainable language and speech
 
+Native C++ inference now supports `native-cpu`, `native-cuda`, and `vulkan`.
+See [NATIVE.md](NATIVE.md) for build instructions, unchanged checkpoint/session
+formats, and backend limitations. Training continues to use PyTorch devices.
+
 NeuroGen now has an optional PyTorch language system alongside the conductance
 simulator. It trains its own weights; it does not contain a pretrained LLM, ASR
 service, or text-to-speech service. The executable training and streaming paths

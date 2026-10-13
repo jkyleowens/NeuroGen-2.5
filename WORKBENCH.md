@@ -1,5 +1,9 @@
 # NeuroGen desktop workbench
 
+Native C++ inference now supports `native-cpu`, `native-cuda`, and `vulkan`.
+See [NATIVE.md](NATIVE.md) for build instructions, unchanged checkpoint/session
+formats, and backend limitations. Training continues to use PyTorch devices.
+
 Run from this project directory in a graphical desktop session:
 
 ```bash

@@ -59,7 +59,9 @@ class Engine:
             self.unload()
             emit('unloaded')
         elif action in ('load', 'create'):
-            device = device_for(request.get('device', 'auto'))
+            from neurogen.language.native import NATIVE_DEVICES, inference_model
+            requested_device = request.get('device', 'auto')
+            device = device_for('cpu' if requested_device in NATIVE_DEVICES else requested_device)
             seed = int(request.get('seed', 1))
             if seed < 0:
                 raise ValueError('Seed must be nonnegative')
@@ -84,6 +86,7 @@ class Engine:
                 model = LanguageModel(config).to(device)
                 identity = 'unsaved-' + uuid.uuid4().hex
                 details = {'path': None, 'step': 0, 'speech_trained': False, 'resume_available': False, 'settings': {}}
+            model = inference_model(model, requested_device)
             candidate = Session(model, seed)
             if cancelled.is_set():
                 emit('cancelled')
@@ -91,7 +94,7 @@ class Engine:
             self.session, self.identity = candidate, identity
             self.ticks = model.config.ticks * (1 + model.config.idle_steps)
             self.activity_known = True
-            self.info = {**model.specification(), **details, 'environment': environment(device)}
+            self.info = {**model.specification(), **details, 'environment': {**environment(device), 'device': getattr(model, 'native_backend', str(device))}}
             gc.collect()
             emit('loaded', info=self.info)
         elif action == 'settings':

@@ -7,6 +7,11 @@ PyTorch system supports CPU, CUDA and ROCm, configurable sizes, joint text/speec
 training and persistent streaming sessions. Its default BC-250 starting profile
 has about 16 million parameters and 8,192 spiking units.
 
+**Native C++ runtime:** the simplified spiking language core can now run through
+the restored engine/column/neuron-array structure with CPU, CUDA, or Vulkan compute.
+See [NATIVE.md](NATIVE.md) for builds, checkpoint-compatible usage, tests, and the
+inference-only scope. Training remains PyTorch.
+
 **For language training, speech, continuous sessions and BC-250 deployment, start
 with [LANGUAGE.md](LANGUAGE.md).** GPU support must be checked on the target board;
 the implementation has CPU and NVIDIA laptop validation. No pretrained language or speech
@@ -157,6 +162,8 @@ training artifacts are required to run either experiment.
 | `tests/` | Dynamics, plasticity, measurement, observer and CLI tests |
 | `benchmark_biology.py`, `audit_rates.py` | Controlled experiments and independent measurement audit |
 
-The retired custom CUDA implementation, old token trainer, old checkpoints, logs, plots,
-audits and obsolete architecture documents have been removed. All generated
+The retired custom CUDA implementation is excluded from the native CMake build.
+The native engine restores its C++ organization while preserving the simplified
+language architecture. Historical source remnants are not part of the active build.
+Old checkpoints, logs, plots, audits and obsolete training artifacts are not required. All generated
 artifacts now live under ignored `runs/` directories.
